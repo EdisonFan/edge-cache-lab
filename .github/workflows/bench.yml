@@ -44,6 +44,21 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: 刷新代理池（启动前探活，剔除已失效出口）
+        # 免费代理衰减极快：实测 177 个出口 1 小时后只剩 15 个存活(8%)。
+        # 采集器启动时一次性读入 proxies_cnb.txt，之后不再重读，
+        # 所以「启动前把死出口剔掉」是池子可用的前提。
+        # 每个 job 在自己的 runner 上独立刷新，互不干扰（比共享一个静态池好）。
+        timeout-minutes: 12
+        shell: bash
+        env:
+          MIN_ALIVE: '40'
+        run: |
+          python3 probe_pool.py || {
+            echo "::error::代理池刷新失败，无可用代理"
+            exit 1
+          }
+
       - name: 采集（special-v1 零丢失）
         # 步骤级超时比 job 级(300)短，超时后 job 不终止，后面 if: always()
         # 的推送步骤仍能把 G2 已落盘的切分计划推上去，下轮复用跳过探测。
