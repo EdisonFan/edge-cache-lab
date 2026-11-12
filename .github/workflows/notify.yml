@@ -1,12 +1,18 @@
 name: Notify gk-collect to pick up results
 
-# 采集批次（bench）一结束，就在 GitHub 侧通知主仓库执行结果转运。
+# 采集批次（bench）一结束就通知主仓转运，纯 GitHub 侧事件驱动。
 # 为什么不由 bench.yml 加 needs 链（2026-11-12）：
 #   GitHub 在 run 启动时锁定工作流定义，改 bench.yml 只对之后新启动的批次生效，
 #   覆盖不到当前在跑的这一批。workflow_run 是事件监听，创建后发生的 completed
 #   事件都能捕获，且不改动采集工作流本身。
-# 为什么不用 schedule：主仓两个带 */10 定时的工作流实测 0 次被调度，
-#   不可依赖。本地 lab_transport.sh 守护也会被沙箱回收，故改为纯事件驱动。
+#
+# 令牌说明（2026-11-12 实测）：
+#   第二仓自有的 GITHUB_TOKEN 跨仓派发主仓会返回
+#   403 Resource not accessible by integration（App token 限本仓），
+#   因此精确通知需要 LAB_DISPATCH_TOKEN（对主仓有 actions:write 的 PAT）。
+#   当前会话令牌无 secrets:write 权限写不进该 secret，故未配置时本 job
+#   直接跳过：主仓 sync-from-lab.yml 已由 push / workflow_run 驱动，
+#   结果照样自动回收，不会漏。配上 secret 后本 job 自动升级为结束时即时通知。
 
 on:
   workflow_run:
@@ -23,15 +29,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: 派发主仓转运工作流
+      - name: 通知主仓转运结果
         shell: bash
         env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOKEN: ${{ secrets.LAB_DISPATCH_TOKEN }}
           SRC_RUN: ${{ github.event.workflow_run.id || 'manual' }}
           SRC_CONCLUSION: ${{ github.event.workflow_run.conclusion || 'manual' }}
         run: |
           set -e
           echo "来源 bench run=$SRC_RUN conclusion=$SRC_CONCLUSION"
+          if [ -z "$TOKEN" ]; then
+            echo "未配置 LAB_DISPATCH_TOKEN，跳过精确通知（主仓 push / workflow_run 已兜底自动回收）"
+            exit 0
+          fi
           code=$(curl -sS --max-time 40 -o /tmp/resp.json -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.github+json" \
