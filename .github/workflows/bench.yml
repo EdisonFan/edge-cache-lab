@@ -1,0 +1,163 @@
+name: bench
+run-name: "bench ${{ inputs.tag }}"
+
+# 专业录取线 apidata/api/gk/score/special。
+# 与 gk-cutoff 完全隔离：独立分支前缀 special-*、独立结果文件名 special_*.json、
+# 独立采集器 collect_special.py（由 v5.3 复制改造，按批次优先二次切分）。
+# 第一版不含自接力：小批验证用；全量时由 feed_special.py --force 重派未达标组合。
+
+on:
+  workflow_dispatch:
+    inputs:
+      combos:
+        description: 'JSON array of "prov-year"'
+        required: true
+        type: string
+        default: '[]'
+      tag:
+        description: '批次标签，便于日志识别'
+        required: false
+        type: string
+        default: 'manual'
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    # 专业线单组合记录数约为投档线的 4~6 倍（41-2025 Σ=40891 ≈ 2045 页），
+    # 60 分钟不够放宽到 180；v1.7 起单省自身封顶需科类、批次两轮额外
+    # 维度探测，44 省实测 180 分钟仍不够，放宽到 300 分钟。
+    # （GitHub 单任务硬上限 360 分钟，留 60 分钟给推送与闸门校验。）
+    # v1.2：max-parallel 5→3。run #3/#4 同时跑导致 10 个 job 共抢 130 个免费
+    # 代理，conn_err 冲到 525 而成功仅 95，代理被超时误判死亡耗尽。
+    # 降到 3 保证同一时刻只有 3 个 job 在池里跑。
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        combo: ${{ fromJSON(inputs.combos) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 采集（special-v1 零丢失）
+        # 步骤级超时比 job 级(300)短，超时后 job 不终止，后面 if: always()
+        # 的推送步骤仍能把 G2 已落盘的切分计划推上去，下轮复用跳过探测。
+        # 否则 job 级超时直接砍掉整个任务，探测成果全丢（#15 实测）。
+        timeout-minutes: 280
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          PROV="${COMBO%%-*}"
+          YEAR="${COMBO##*-}"
+          export PROV YEAR
+          echo "=== special $PROV-$YEAR ==="
+          mkdir -p out
+          BR="special-${PROV}-${YEAR}"
+          if git fetch -q --depth=1 origin "refs/heads/${BR}" 2>/dev/null; then
+            git show "FETCH_HEAD:out/special_${PROV}_${YEAR}.json" > out/prev.json 2>/dev/null || rm -f out/prev.json
+            # v1.6：取回上轮落盘的切分计划，重跑时跳过 135 分钟探测
+            git show "FETCH_HEAD:out/plan_${PROV}_${YEAR}.json" > out/partition_plan_prev.json 2>/dev/null || rm -f out/partition_plan_prev.json
+            echo "已读取上轮 $BR 结果与切分计划"
+          fi
+          python3 collect_special.py
+
+      - name: 推送结果分支（闸门未过也保留增量）
+        if: always()
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          PROV="${COMBO%%-*}"
+          YEAR="${COMBO##*-}"
+          BR="special-${PROV}-${YEAR}"
+          F="out/special_${PROV}_${YEAR}.json"
+          PLAN="out/plan_${PROV}_${YEAR}.json"
+          # v1.6：采集器在 G2 完备切分成功后立即落盘切分计划。
+          # 大省探测实测耗时 135 分钟，job 撞 180 分钟被砍时结果文件不会
+          # 生成，但计划文件已在磁盘上。此时照样推计划，下轮复用即可跳过探测。
+          if [ -s out/partition_plan.json ]; then
+            cp out/partition_plan.json "$PLAN"
+          fi
+          git config user.email "gk-collect@users.noreply.github.com"
+          git config user.name "gk-collect"
+          git checkout -B "$BR"
+          PUSHED=""
+          if [ -s "$F" ]; then
+            GP=$(python3 -c "import json;print(json.load(open('$F')).get('gate_pass', False))")
+            OLD_GP="False"
+            if [ -s out/prev.json ]; then
+              OLD_GP=$(python3 -c "import json;print(json.load(open('out/prev.json')).get('gate_pass', False))" 2>/dev/null || echo False)
+            fi
+            if [ "$GP" = "False" ] && [ "$OLD_GP" = "True" ]; then
+              echo "新结果闸门未过，云端已有达标结果，跳过结果推送避免降级"
+            else
+              git add -f "$F"
+              PUSHED="result(gate_pass=${GP})"
+            fi
+          else
+            echo "本轮无结果文件（采集未完成/超时），仅推送切分计划"
+          fi
+          if [ -s "$PLAN" ]; then
+            git add -f "$PLAN"
+            PUSHED="${PUSHED:+$PUSHED }plan"
+          fi
+          if [ -z "$PUSHED" ]; then
+            echo "无结果也无计划，跳过推送，云端旧结果不变"
+            rm -f out/prev.json
+            exit 0
+          fi
+          git commit -m "dataset ${PROV}-${YEAR} ${PUSHED}" || echo "无变更"
+          git push -f origin "HEAD:refs/heads/${BR}"
+          echo "已推送 $BR (${PUSHED})"
+          rm -f out/prev.json
+
+      - name: 上传结果制品
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: res-${{ matrix.combo }}
+          path: out/special_*.json
+          if-no-files-found: ignore
+          retention-days: 90
+          overwrite: true
+
+      - name: 闸门校验（未全过则判失败，触发重派）
+        if: always()
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          F="out/special_${COMBO%%-*}_${COMBO##*-}.json"
+          if [ ! -s "$F" ]; then
+            # 结果文件只在采完且闸门判完后写。探测阶段耗时长（大省实测 135 分钟）
+            # 或 job 撞 180 分钟超时被砍时，文件不会生成，但 G1 通常早已通过。
+            # 原报错写作「G1 BASE 未取到」会误导排查，此处如实描述。
+            if [ -s out/partition_plan.json ]; then
+              echo "::error::${COMBO} 采集未完成（探测耗时/超时被砍），切分计划已落盘，下轮复用跳过探测"
+            else
+              echo "::error::${COMBO} 无结果文件（采集未完成或 G1 未取到），判失败待重派"
+            fi
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, sys
+          prov, year = os.environ['COMBO'].split('-', 1)
+          d = json.load(open('out/special_%s_%s.json' % (prov, year)))
+          print('闸门明细:', json.dumps(d.get('gate'), ensure_ascii=False))
+          print('numFound=%s count=%s partition_count=%s gate_pass=%s' %
+                (d.get('num_found'), d.get('count'), d.get('partition_count'),
+                 d.get('gate_pass')))
+          if not d.get('gate_pass'):
+              print('::error::%s-%s 闸门未全过，判失败待重派' % (prov, year))
+              sys.exit(1)
+          print('%s-%s 零丢失达标：count == numFound' % (prov, year))
+          PY
