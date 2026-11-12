@@ -1,0 +1,47 @@
+name: Notify gk-collect to pick up results
+
+# 采集批次（bench）一结束，就在 GitHub 侧通知主仓库执行结果转运。
+# 为什么不由 bench.yml 加 needs 链（2026-11-12）：
+#   GitHub 在 run 启动时锁定工作流定义，改 bench.yml 只对之后新启动的批次生效，
+#   覆盖不到当前在跑的这一批。workflow_run 是事件监听，创建后发生的 completed
+#   事件都能捕获，且不改动采集工作流本身。
+# 为什么不用 schedule：主仓两个带 */10 定时的工作流实测 0 次被调度，
+#   不可依赖。本地 lab_transport.sh 守护也会被沙箱回收，故改为纯事件驱动。
+
+on:
+  workflow_run:
+    workflows: ["bench"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 派发主仓转运工作流
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC_RUN: ${{ github.event.workflow_run.id || 'manual' }}
+          SRC_CONCLUSION: ${{ github.event.workflow_run.conclusion || 'manual' }}
+        run: |
+          set -e
+          echo "来源 bench run=$SRC_RUN conclusion=$SRC_CONCLUSION"
+          code=$(curl -sS --max-time 40 -o /tmp/resp.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d '{"ref":"main"}' \
+            "https://api.github.com/repos/EdisonFan/gk-collect/actions/workflows/sync-from-lab.yml/dispatches")
+          echo "派发主仓 sync-from-lab.yml: HTTP $code"
+          if [ "$code" != "204" ]; then
+            echo "::error::跨仓派发失败，响应："
+            cat /tmp/resp.json 2>/dev/null || true
+            exit 1
+          fi
+          echo "已通知主仓，转运工作流将校验 gate_pass 后回收达标结果"
