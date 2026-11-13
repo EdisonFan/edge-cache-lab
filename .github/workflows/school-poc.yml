@@ -1,0 +1,101 @@
+name: school-poc
+run-name: "school-poc ${{ inputs.tag }}"
+
+# 按 school_id 单校分片的 POC：一次并发启动 2 所学校，验证
+# 「school_id 筛选生效 / 单校片能采全 / 数据不串片 / 唯一 id / 页零失败」。
+#
+# 隔离约束（2026-11-13）：
+#  1. 工作流名不叫 bench —— 仓库二 notify.yml 监听 workflow_run: bench，
+#     用别名避免触发主仓 sync-from-lab 的无意义转运。
+#  2. 结果只走 upload-artifact，绝不 push special-* 分支 —— 主仓
+#     sync-from-lab 只认 special-*，推上去会被当成组合结果回收，污染主仓。
+#  3. 每个 job 独立刷新代理池（probe_pool.py 就地重写工作区文件，不回写远端）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      schools:
+        description: 'JSON 数组，要并发跑的 school_id（POC 默认 2 所）'
+        required: true
+        type: string
+        default: '[678,1165]'
+      prov:
+        description: '考生省'
+        required: false
+        type: string
+        default: '37'
+      year:
+        description: '年份'
+        required: false
+        type: string
+        default: '2024'
+      min_alive:
+        description: '启动前最少存活代理数（POC 小批量设低一些，加快启动）'
+        required: false
+        type: string
+        default: '10'
+      tag:
+        description: '批次标签'
+        required: false
+        type: string
+        default: 'sid-poc'
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        school: ${{ fromJSON(inputs.schools) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 打印本次切分计划
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          p=json.load(open('school_plan_${{ inputs.prov }}_${{ inputs.year }}.json'))
+          print('组合 %s-%s | 维度 %s | 全集 %d 所 | 山东 %d 所' %
+                (p['prov'],p['year'],p['dimension'],p['total_schools'],p['regions'].get('37',0)))
+          print('切分口径:',p['why'])
+          print('完备判据:',p['completeness_rule'])
+          print('本批次学校:', ${{ inputs.schools }})
+          PY
+
+      - name: 启动前刷新代理池（就地重写工作区，不回写远端）
+        timeout-minutes: 10
+        shell: bash
+        env:
+          MIN_ALIVE: ${{ inputs.min_alive }}
+          POOL_DEADLINE: '300'
+        run: |
+          python3 probe_pool.py
+
+      - name: 采集单校分片
+        timeout-minutes: 25
+        shell: bash
+        env:
+          PROV: ${{ inputs.prov }}
+          YEAR: ${{ inputs.year }}
+          SCHOOL: ${{ matrix.school }}
+        run: |
+          set -e
+          echo "=== school_id=${SCHOOL} PROV=${PROV} YEAR=${YEAR} ==="
+          python3 collect_by_school.py
+
+      - name: 上传单校结果制品
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schoolpoc-${{ inputs.tag }}-${{ inputs.prov }}-${{ inputs.year }}-${{ matrix.school }}
+          path: out/school_*.json
+          if-no-files-found: warn
+          retention-days: 14
