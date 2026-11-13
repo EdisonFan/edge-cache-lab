@@ -1,0 +1,143 @@
+name: school-probe
+run-name: "school-probe ${{ inputs.tag }}"
+
+# school_id 全集探测：证明 2970 校全集的 Σ 守恒，并产出「有招生院校清单」。
+# 这是 37-<年> 用 school_id 收口的决定性前置步骤；只出制品，不推任何分支。
+#
+# 隔离（同 school-poc）：
+#  * 名不叫 bench —— 不触发本仓 notify.yml -> 主仓 sync-from-lab；
+#  * 结果只走 upload-artifact —— 主仓回收只认 special-*，绝不污染；
+#  * 每分片 job 独立刷池，max-parallel: 2 —— 实测 4 并发会打穿探测请求。
+
+on:
+  workflow_dispatch:
+    inputs:
+      prov:
+        description: '考生省'
+        required: false
+        type: string
+        default: '37'
+      year:
+        description: '年份'
+        required: false
+        type: string
+        default: '2024'
+      true_nf:
+        description: '34省Σ真值基准（旧口径日志，用于 Σ 守恒对齐）'
+        required: false
+        type: string
+        default: '32723'
+      min_alive:
+        description: '每分片启动前最少存活代理数'
+        required: false
+        type: string
+        default: '40'
+      tag:
+        description: '批次标签'
+        required: false
+        type: string
+        default: 'sid-full-probe'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 打印切分计划
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          p = json.load(open('school_plan_${{ inputs.prov }}_${{ inputs.year }}.json'))
+          print('组合 %s-%s | 维度 %s | 全集 %d 所 | 分片 10 | 本片 index=%s' %
+                (p['prov'], p['year'], p['dimension'], p['total_schools'], '${{ matrix.shard }}'))
+          print('完备判据:', p['completeness_rule'])
+          PY
+
+      - name: 刷新代理池（就地重写，不回写远端）
+        timeout-minutes: 12
+        shell: bash
+        env:
+          MIN_ALIVE: ${{ inputs.min_alive }}
+          POOL_DEADLINE: '420'
+        run: python3 probe_pool.py
+
+      - name: 探测本分片学校 numFound
+        timeout-minutes: 35
+        shell: bash
+        env:
+          PROV: ${{ inputs.prov }}
+          YEAR: ${{ inputs.year }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: '10'
+          PROBE_WORKERS: '6'
+        run: python3 school_probe_all.py
+
+      - name: 上传分片结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-shard-${{ matrix.shard }}
+          path: out/probe_shard_*.json*
+          if-no-files-found: warn
+          retention-days: 14
+
+  summarize:
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: probe-shard-*
+          merge-multiple: true
+          path: out
+      - name: 汇总 Σ 守恒与空片清单
+        shell: bash
+        env:
+          PROV: ${{ inputs.prov }}
+          YEAR: ${{ inputs.year }}
+        run: |
+          python3 - <<'PY'
+          import json, glob, os, sys
+          sys.path.insert(0, '.')
+          from school_probe_all import summarize
+          files = sorted(glob.glob('out/probe_shard_*.json'))
+          shards = [json.load(open(f, encoding='utf-8')) for f in files]
+          plan = json.load(open('school_plan_${{ inputs.prov }}_${{ inputs.year }}.json', encoding='utf-8'))
+          r = summarize(shards, '${{ inputs.true_nf }}', plan['school_ids'])
+          r['shards'] = len(files)
+          r['all_jobs_success'] = ('${{ needs.probe.result }}' == 'success')
+          r['trusted'] = r['conserve'] and r['all_jobs_success'] and len(files) == 10
+          out = 'out/school_probe_full_${{ inputs.prov }}_${{ inputs.year }}.json'
+          json.dump(r, open(out, 'w', encoding='utf-8'), ensure_ascii=False)
+          print('PROBE_RESULT_JSON ' + json.dumps({k: r[k] for k in
+                ('expected_schools', 'probed_schools', 'ok', 'failed', 'sigma',
+                 'true_nf', 'delta', 'nonempty_schools', 'empty_schools',
+                 'conserve', 'trusted')}, ensure_ascii=False), flush=True)
+          print('结果文件 %s (%.1f KB)' % (out, os.path.getsize(out) / 1024), flush=True)
+          if not r['trusted']:
+              print('::warning::Σ 未守恒或有分片失败/缺失，不进入全量采集阶段', flush=True)
+          PY
+      - name: 上传汇总结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: school-probe-full-${{ inputs.prov }}-${{ inputs.year }}
+          path: out/school_probe_full_*.json
+          retention-days: 30
